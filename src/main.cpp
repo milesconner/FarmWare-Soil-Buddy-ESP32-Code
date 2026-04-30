@@ -30,12 +30,12 @@ const uint8_t moisture_sensor_I2C_address = 0x36;
 //WiFi credentials (only one should be uncommented)
 
 //Miles' apartment
-const char* wifi_ssid = "Heritage Apartments (hacooh)";
-const char* wifi_password = "owl601gentle";
+//const char* wifi_ssid = "Heritage Apartments (hacooh)";
+//const char* wifi_password = "owl601gentle";
 
 //OSU
-//const char* wifi_ssid = "";
-//const char* wifi_password = "";
+const char* wifi_ssid = "Registered4OSU";
+const char* wifi_password = "aC7Yb6rcLu5xuWe3";
 
 //MQTT server credentials
 const char* mqtt_server_url = "9ccaa78e62aa4522ab541b0ca1426b5c.s1.eu.hivemq.cloud";
