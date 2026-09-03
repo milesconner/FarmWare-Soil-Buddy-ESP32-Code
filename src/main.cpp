@@ -30,8 +30,8 @@ const uint8_t moisture_sensor_I2C_address = 0x36;
 //WiFi credentials (only one should be uncommented)
 
 //Miles' apartment
-//const char* wifi_ssid = "Heritage Apartments (hacooh)";
-//const char* wifi_password = "owl601gentle";
+//const char* wifi_ssid = "Tremors 7";
+//const char* wifi_password = "gloverforn64";
 
 //OSU
 const char* wifi_ssid = "Registered4OSU";
