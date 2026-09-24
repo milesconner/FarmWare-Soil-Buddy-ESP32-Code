@@ -8,6 +8,10 @@
 //libraries for the moisture sensor
 #include <Adafruit_seesaw.h>
 
+//libraries for the air quality sensor
+#include <Adafruit_BME680.h>
+#include <bsec.h>
+
 //libraries for WiFi and MQTT server
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -19,6 +23,9 @@
 //how long the Soil Buddy should sleep for by default (in mins)
 #define default_sleep_period 1
 
+//for the air quality sensor (unused)
+#define SEALEVELPRESSURE_HPA (1013.25)
+
 //temperature sensor object
 OneWire one_wire(temperature_sensor_pin);
 DallasTemperature temperature_sensor(&one_wire);
@@ -26,6 +33,10 @@ DallasTemperature temperature_sensor(&one_wire);
 //moisture sensor object
 Adafruit_seesaw moisture_sensor;
 const uint8_t moisture_sensor_I2C_address = 0x36;
+
+//air quality sensor object
+Adafruit_BME680 air_quality_sensor;
+const uint8_t air_quality_sensor_I2C_address = 0x76;
 
 //WiFi credentials (only one should be uncommented)
 
@@ -59,6 +70,9 @@ const char* temperature_data_topic = "soil-buddy-prototype/temperature-data";
 //MQTT topic for publishing moisture data
 const char* moisture_data_topic = "soil-buddy-prototype/moisture-data";
 
+//MQTT topic for publishing air quality data
+const char* air_quality_data_topic = "soil-buddy-prototype/air-quality-data";
+
 //how long the Soil Buddy will sleep for (in mins)
 //gets set by the sleep config topic, otherwise it'll use the default value
 int sleep_period = default_sleep_period;
@@ -68,6 +82,7 @@ void connect_to_mqtt_server();
 void mqtt_callback_function(char* topic, uint8_t* message, unsigned int length);
 float read_temperature_sensor();
 uint16_t read_moisture_sensor();
+uint32_t read_air_quality_sensor();
 
 void setup() {
   //begin serial monitor
@@ -86,6 +101,17 @@ void setup() {
 
   Serial.printf("Moisture sensor online...\n\n");
 
+  //initialize air quality sensor
+  air_quality_sensor.begin(air_quality_sensor_I2C_address);
+
+  air_quality_sensor.setTemperatureOversampling(BME680_OS_8X);
+  air_quality_sensor.setHumidityOversampling(BME680_OS_2X);
+  air_quality_sensor.setPressureOversampling(BME680_OS_4X);
+  air_quality_sensor.setIIRFilterSize(BME680_FILTER_SIZE_3);
+  air_quality_sensor.setGasHeater(320, 150);
+
+  Serial.printf("Air quality sensor online...\n\n");
+
   //connect to WiFi
   connect_to_wifi();
 
@@ -102,17 +128,21 @@ void setup() {
   //read sensors
   float temp = read_temperature_sensor();
   uint16_t cap = read_moisture_sensor();
+  uint32_t air = read_air_quality_sensor();
 
   //convert sensor data to strings
   char temp_message[10];
   char cap_message[10];
+  char air_message[10];
 
   dtostrf(temp, 1, 2, temp_message);
   itoa(cap, cap_message, 10);
+  itoa(air, air_message, 10);
 
   //publish sensor data to the MQTT server
   mqtt_client.publish(temperature_data_topic, temp_message);
   mqtt_client.publish(moisture_data_topic, cap_message);
+  mqtt_client.publish(air_quality_data_topic, air_message);
 
   Serial.printf("\nPublished data to MQTT server.\n\nGoing into deep sleep for %d minutes.\nSee you then!\n\n", sleep_period);
 
@@ -184,7 +214,7 @@ float read_temperature_sensor() {
   temperature_sensor.requestTemperatures();
   float temp_fahrenheit = temperature_sensor.getTempFByIndex(0);
 
-  Serial.printf("Temperature reading in Fahrenheit: %.2f\n", temp_fahrenheit);
+  Serial.printf("Temperature reading in Fahrenheit: %.3f\n", temp_fahrenheit);
 
   return temp_fahrenheit;
 }
@@ -193,7 +223,17 @@ float read_temperature_sensor() {
 uint16_t read_moisture_sensor() {
   uint16_t capacitance = moisture_sensor.touchRead(0);
 
-  Serial.printf("Capacitance reading (moisture level, higher = more moisture): %hu\n", capacitance);
+  Serial.printf("Capacitance reading (moisture, higher = more moisture): %hu\n", capacitance);
 
   return capacitance;
+}
+
+//function returns air quality value
+uint32_t read_air_quality_sensor() {
+  air_quality_sensor.performReading();
+  uint32_t air_quality = air_quality_sensor.gas_resistance;
+
+  Serial.printf("Gas resistance reading in Ohms (air pollutants (VOCs), higher = better air quality): %hu \n", air_quality);
+
+  return air_quality;
 }
