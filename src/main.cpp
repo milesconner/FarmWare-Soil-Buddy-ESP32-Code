@@ -69,9 +69,21 @@ void mqtt_callback_function(char* topic, uint8_t* message, unsigned int length);
 float read_temperature_sensor();
 uint16_t read_moisture_sensor();
 
+//Setup for RGB LED
+const int redPin = 27;
+const int greenPin = 12;
+const int bluePin = 13;
+
 void setup() {
   //begin serial monitor
   Serial.begin(115200);
+
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  digitalWrite(redPin, HIGH);
+  digitalWrite(greenPin, HIGH);
+  digitalWrite(bluePin, HIGH);
 
   Serial.printf("\n\n");
   Serial.printf("Soil Buddy Prototype is awake...\n\n");
