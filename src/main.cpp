@@ -1,6 +1,9 @@
 
 #include <Arduino.h>
 
+#include <Wire.h>
+#include <SPI.h>
+
 //libraries for the temperature sensor
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -17,8 +20,19 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
-//temperature sensor is connected to GPIO 4
-#define temperature_sensor_pin 4
+//libraries for LoRa comms
+#include <LoRa.h>
+
+//LoRa transceiver pins
+#define G0 4 //orange (IRQ/DIO0)
+#define SCK 18 //blue
+#define MISO 19 //green
+#define MOSI 23 //yellow
+#define CS 17 //white (NSS/SS)
+#define RST 16 //red (NRESET/RESET)
+
+//temperature sensor is connected to GPIO 14
+#define temperature_sensor_pin 14
 
 //how long the Soil Buddy should sleep for by default (in mins)
 #define default_sleep_period 1
@@ -83,6 +97,9 @@ void mqtt_callback_function(char* topic, uint8_t* message, unsigned int length);
 float read_temperature_sensor();
 uint16_t read_moisture_sensor();
 uint32_t read_air_quality_sensor();
+void init_lora();
+void send_lora_string(const char* message);
+void lora_received(int packet_size);
 
 //Setup for RGB LED
 const int redPin = 27;
@@ -123,6 +140,9 @@ void setup() {
   air_quality_sensor.setGasHeater(320, 150);
 
   Serial.printf("Air quality sensor online...\n\n");
+
+  //initialize LoRa
+  init_lora();
 
   //connect to WiFi
   connect_to_wifi();
@@ -171,6 +191,53 @@ void setup() {
 void loop() {
   //loop should never be reached unless deep sleep is broken
   Serial.printf("YOU SHOULDN'T BE SEEING THIS!!\n\n");
+}
+
+//function initializes the LoRa transceiver
+void init_lora() {
+  LoRa.setPins(CS, RST, G0);
+
+  Serial.printf("Initializing LoRa...");
+
+  while(! LoRa.begin(915E6)) {
+    delay(500);
+    Serial.printf(".");
+  }
+
+  LoRa.setSyncWord(0xF3);
+
+  LoRa.onReceive(lora_received);
+  LoRa.receive();
+
+  Serial.printf("\nLoRa online!\n\n");
+}
+
+//function transmits a string over LoRa
+void send_lora_string(const char* message) {
+  LoRa.beginPacket();
+  LoRa.print(message);
+  LoRa.endPacket();
+
+  Serial.printf("Sent '");
+  Serial.printf(message);
+  Serial.printf("' over LoRa.\n\n");
+}
+
+//function is called everytime a LoRa packet is received
+//this is called from an ISR and shouldn't be doing serial prints, but it's whatever for now
+void lora_received(int packet_size) {
+  Serial.printf("LoRa packet received.\n");
+  Serial.printf("Packet size: %d\n", packet_size);
+  Serial.printf("Message: ");
+
+  while(LoRa.available()) {
+    String data = LoRa.readString();
+    Serial.print(data);
+  }
+
+  Serial.printf("\n");
+  Serial.printf("RSSI: %d\n", LoRa.packetRssi());
+  Serial.printf("SNR: %.3f\n\n", LoRa.packetSnr());
 }
 
 //function connects to the WiFi network
