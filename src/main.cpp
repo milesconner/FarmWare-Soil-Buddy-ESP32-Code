@@ -49,8 +49,10 @@ uint16_t read_moisture_sensor(); //returns capacitance (higher = more moisture)
 
 //air quality sensor functions
 uint8_t init_air_quality_sensor(); //sets up air quality sensor, returns whether it succeeded
-uint16_t read_air_quality_index();    // returns IAQ (0-500, lower = better air quality)
+uint16_t read_air_quality_index(); // returns IAQ (0-500, lower = better air quality)
+uint16_t read_vapor_pressure_defecit(); //returns VPD (<0.4: low, 0.4-1.2: sweet spot, 1.2-1.6: high, >1.6: dangerous)
 uint32_t read_air_quality_sensor(); //returns gas resistance (higher = better air quality)
+
 
 //LoRa functions
 uint8_t init_lora(); //sets up LoRa, returns whether it succeeded
@@ -104,7 +106,6 @@ void loop() {
   //1.implement FSM to progress through a wake cycle using the loop
   //2.figure out how to measure battery life from software
   //3.figure out air quality sensor 
-  //    -desoldering debacle
   //    -bosch library to get IAQ
   //    -calibration nightmare
   //    -look into using VPD instead of IAQ
@@ -202,6 +203,23 @@ uint16_t read_air_quality_index() {
   Serial.printf("IAQ reading (lower = better air quality): %hu \n", iaq);
 
   return iaq;
+}
+
+uint16_t read_vapor_pressure_deficit() {
+  air_quality_sensor.run();
+
+  float temperature = air_quality_sensor.temperature;
+  float humidity = air_quality_sensor.humidity;
+
+  float saturation_vapor_pressure = 0.6108 * exp((17.27 * temperature) / (temperature + 237.3));
+  float actual_vapor_pressure = (humidity / 100.0) * saturation_vapor_pressure;
+  float vapor_pressure_deficit = saturation_vapor_pressure - actual_vapor_pressure;
+
+  uint16_t vpd = (uint16_t)(vapor_pressure_deficit * 100); // Scale up for better resolution
+
+  Serial.printf("VPD Reading: %hu \n", vpd);
+
+  return vpd;
 }
 
 uint8_t init_lora() {
