@@ -9,7 +9,7 @@
 #include <Adafruit_seesaw.h>
 
 //libraries for the air quality sensor
-#include <Adafruit_BME680.h> //basic adafruit library (can only do raw gas resistance)
+#include <Wire.h> //I2C Bus
 #include <bsec.h> //more complicated bosch library (can do IAQ)
 
 //libraries for LoRa comms
@@ -33,7 +33,7 @@ Adafruit_seesaw moisture_sensor;
 const uint8_t moisture_sensor_I2C_address = 0x36;
 
 //air quality sensor object
-Adafruit_BME680 air_quality_sensor;
+Bsec air_quality_sensor;
 const uint8_t air_quality_sensor_I2C_address = 0x76;
 
 //volatile flag that gets set every time a new LoRa transmission is received
@@ -49,6 +49,7 @@ uint16_t read_moisture_sensor(); //returns capacitance (higher = more moisture)
 
 //air quality sensor functions
 uint8_t init_air_quality_sensor(); //sets up air quality sensor, returns whether it succeeded
+uint16_t read_air_quality_index();    // returns IAQ (0-500, lower = better air quality)
 uint32_t read_air_quality_sensor(); //returns gas resistance (higher = better air quality)
 
 //LoRa functions
@@ -165,17 +166,20 @@ uint16_t read_moisture_sensor() {
 }
 
 uint8_t init_air_quality_sensor() {
-  if(! air_quality_sensor.begin(air_quality_sensor_I2C_address)) {
+  air_quality_sensor.begin(air_quality_sensor_I2C_address, Wire);
+  if(! air_quality_sensor.bme68xStatus != BME68X_OK) {
     Serial.printf("Air quality sensor failed to initialize!\n");
 
     return 0;
   }
 
-  air_quality_sensor.setTemperatureOversampling(BME680_OS_8X);
-  air_quality_sensor.setHumidityOversampling(BME680_OS_2X);
-  air_quality_sensor.setPressureOversampling(BME680_OS_4X);
-  air_quality_sensor.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  air_quality_sensor.setGasHeater(320, 150);
+  bsec_virtual_sensor_t sensor_list[] = {BSEC_OUTPUT_IAQ, BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS};
+  air_quality_sensor.updateSubscription(sensor_list, sizeof(sensor_list) / sizeof(sensor_list[0]), BSEC_SAMPLE_RATE_ULP);
+  //air_quality_sensor.setTemperatureOversampling(BME680_OS_8X);
+  //air_quality_sensor.setHumidityOversampling(BME680_OS_2X);
+  //air_quality_sensor.setPressureOversampling(BME680_OS_4X);
+  //air_quality_sensor.setIIRFilterSize(BME680_FILTER_SIZE_3);
+  //air_quality_sensor.setGasHeater(320, 150);
 
   Serial.printf("Air quality sensor online...\n");
 
@@ -183,12 +187,21 @@ uint8_t init_air_quality_sensor() {
 }
 
 uint32_t read_air_quality_sensor() {
-  air_quality_sensor.performReading();
-  uint32_t gas_resistance = air_quality_sensor.gas_resistance;
+  air_quality_sensor.run();
+  uint32_t gas_resistance = (uint32_t)air_quality_sensor.gasResistance;
 
   Serial.printf("Gas resistance reading (higher = better air quality): %hu \n", gas_resistance);
 
   return gas_resistance;
+}
+
+uint16_t read_air_quality_index() {
+  air_quality_sensor.run();
+  uint16_t iaq = (uint16_t)air_quality_sensor.iaq;
+
+  Serial.printf("IAQ reading (lower = better air quality): %hu \n", iaq);
+
+  return iaq;
 }
 
 uint8_t init_lora() {
