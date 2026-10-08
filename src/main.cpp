@@ -64,6 +64,9 @@ const int redPin = 27;
 const int greenPin = 12;
 const int bluePin = 13;
 
+//Setup for photodiode
+const int photodiodePin = 33;
+
 void setup() {
   //RGB LED stuff
   pinMode(redPin, OUTPUT);
