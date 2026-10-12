@@ -1,274 +1,143 @@
 
+//BME680 low power test
+
 #include <Arduino.h>
 
-//libraries for the temperature sensor
-#include <OneWire.h>
-#include <DallasTemperature.h>
+#include <Wire.h>
+#include <bsec.h>
 
-//libraries for the moisture sensor
-#include <Adafruit_seesaw.h>
-
-//libraries for the air quality sensor
-#include <Wire.h> //I2C Bus
-#include <bsec.h> //more complicated bosch library (can do IAQ)
-
-//libraries for LoRa comms
-#include <LoRa.h>
-#include <SPI.h>
-
-//LoRa transceiver pins
-#define G0 4
-#define CS 17
-#define RST 16
-
-//temperature sensor is connected to GPIO 14
-#define temperature_sensor_pin 14
-
-//temperature sensor object
-OneWire one_wire(temperature_sensor_pin);
-DallasTemperature temperature_sensor(&one_wire);
-
-//moisture sensor object
-Adafruit_seesaw moisture_sensor;
-const uint8_t moisture_sensor_I2C_address = 0x36;
-
-//air quality sensor object
 Bsec air_quality_sensor;
 const uint8_t air_quality_sensor_I2C_address = 0x76;
 
-//volatile flag that gets set every time a new LoRa transmission is received
-volatile bool pending_lora_packet = false;
+uint64_t measurement_period = 300000000; //bme will have a new measurement ready every 5 minutes
+uint64_t grace_window = 15000000; //wake up 15 seconds early to make sure we're ready to call run() before the bme has a new measurement ready
 
-//temperature sensor functions
-uint8_t init_temperature_sensor(); //sets up temp sensor, returns whether it succeeded
-float read_temperature_sensor(); //returns temp in F
+//need to save bme state across sleep cycles
+RTC_DATA_ATTR uint8_t air_quality_state[BSEC_MAX_STATE_BLOB_SIZE]; //bme state
+RTC_DATA_ATTR bool air_quality_state_available = false; //will be false on our first cycle, then should remain true. this prevents trying to load a state that doesn't exist yet
 
-//moisture sensor functions
-uint8_t init_moisture_sensor(); //sets up moisture sensor, returns whether it succeeded
-uint16_t read_moisture_sensor(); //returns capacitance (higher = more moisture)
+//need to keep time across sleep cycles
+RTC_DATA_ATTR uint64_t total_time_since_cold_boot = 0; //how long we've been running since first turning on the mcu
+RTC_DATA_ATTR uint64_t measurement_counter = 0; //how many measurements we've made since first turning on the mcu
 
-//air quality sensor functions
-uint8_t init_air_quality_sensor(); //sets up air quality sensor, returns whether it succeeded
-uint16_t read_air_quality_index(); // returns IAQ (0-500, lower = better air quality)
-uint16_t read_vapor_pressure_defecit(); //returns VPD (<0.4: low, 0.4-1.2: sweet spot, 1.2-1.6: high, >1.6: dangerous)
-uint32_t read_air_quality_sensor(); //returns gas resistance (higher = better air quality)
-
-
-//LoRa functions
-uint8_t init_lora(); //sets up LoRa, returns whether it succeeded
-void lora_packet_received(int packet_size); //gets called every time a new LoRa transmission is received
-void process_lora_packet(); //function to process received LoRa packets
-uint8_t send_config_request(); //function to request config from gateway
-uint8_t send_soil_data(uint8_t* data_buffer, size_t buffer_size); //function to send soil data to gateway
-uint8_t send_acknowledgement(); //function to send acknowledgement to gateway
-
-//Setup for RGB LED
-const int redPin = 27;
-const int greenPin = 12;
-const int bluePin = 13;
+float calculate_VPD(float temperature, float humidity); //function to calculate VPD
 
 void setup() {
-  //RGB LED stuff
-  pinMode(redPin, OUTPUT);
-  pinMode(greenPin, OUTPUT);
-  pinMode(bluePin, OUTPUT);
-  digitalWrite(redPin, HIGH);
-  digitalWrite(greenPin, HIGH);
-  digitalWrite(bluePin, HIGH);
-
-  //begin serial monitor
   Serial.begin(115200);
-  Serial.printf("\n\nSoil Buddy Prototype is awake...\n");
 
-  //initialize temperature sensor
-  init_temperature_sensor();
+  //initialize i2c bus and bme
+  Wire.begin();
+  air_quality_sensor.begin(air_quality_sensor_I2C_address, Wire);
+  
+  bsec_virtual_sensor_t sensor_list[13] = {
+    BSEC_OUTPUT_RAW_GAS,
+    BSEC_OUTPUT_GAS_PERCENTAGE,
+    BSEC_OUTPUT_IAQ,
+    BSEC_OUTPUT_STATIC_IAQ,
+    BSEC_OUTPUT_CO2_EQUIVALENT,
+    BSEC_OUTPUT_BREATH_VOC_EQUIVALENT,
+    BSEC_OUTPUT_RAW_TEMPERATURE,
+    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
+    BSEC_OUTPUT_RAW_HUMIDITY,
+    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
+    BSEC_OUTPUT_RAW_PRESSURE,
+    BSEC_OUTPUT_STABILIZATION_STATUS,
+    BSEC_OUTPUT_RUN_IN_STATUS
+  };
 
-  //initialize moisture sensor
-  init_moisture_sensor();
+  air_quality_sensor.updateSubscription(sensor_list, 13, BSEC_SAMPLE_RATE_ULP);
 
-  //initialize air quality sensor
-  init_air_quality_sensor();
+  //restore bme state from rtc memory, unless this is our first cycle
+  if(air_quality_state_available) {
+    air_quality_sensor.setState(air_quality_state);
+  }
 
-  //initialize LoRa
-  init_lora();
+  //loop until the bme has its measurement ready
+  while(! air_quality_sensor.run()) {
+    delay(1);
+  }
+
+  uint64_t measurement_time = esp_timer_get_time(); //log measurement time relative to boot from sleep
+  measurement_counter++; //increment our measurement counter
+
+  //calculate hours:minutes:seconds elapsed between cold boot and measurement
+  //this is the measurement time as tracked by the mcu
+  uint64_t time_running_seconds = (total_time_since_cold_boot + measurement_time) / 1000000;
+  uint64_t rtc_hours = time_running_seconds / 3600;
+  uint64_t rtc_minutes = (time_running_seconds % 3600) / 60;
+  uint64_t rtc_seconds = (time_running_seconds % 3600) % 60;
+
+  //convert bme's reported measurement timestamp to hours:minutes:seconds
+  //this is the measurement time as reported by the bme, it should be close to what we calculated above
+  uint64_t timestamp_seconds = air_quality_sensor.outputTimestamp / 1000;
+  uint64_t bme_hours = timestamp_seconds / 3600;
+  uint64_t bme_minutes = (timestamp_seconds % 3600) / 60;
+  uint64_t bme_seconds = (timestamp_seconds % 3600) % 60;
+
+  //log literally everything
+  Serial.printf("\n\n\n\n\n");
+  Serial.printf("Measurement Number: %hu \n", measurement_counter);
+  Serial.printf("Measurement Time (As Reported By MCU): %hu::%hu::%hu (hours:minutes:seconds) \n", rtc_hours, rtc_minutes, rtc_seconds);
+  Serial.printf("Measurement Time (As Reported By BME): %hu::%hu::%hu (hours:minutes:seconds) \n", bme_hours, bme_minutes, bme_seconds);
+  Serial.printf("BME Status Code: %d \n", air_quality_sensor.bme68xStatus);
+  Serial.printf("BSEC Status Code: %d \n", air_quality_sensor.bsecStatus);
+  Serial.printf("BSEC Version: %d \n", air_quality_sensor.version);
+  Serial.printf("Stabilization Status: %f (has the MOX heater stablized, 0 = no, 1 = yes) \n", air_quality_sensor.stabStatus);
+  Serial.printf("Run In Status: %f (has the burn-in profile finished, 0 = no, 1 = yes) \n", air_quality_sensor.runInStatus);
+  Serial.printf("----------------------------------IAQ---------------------------------- \n");
+  Serial.printf("Raw Gas Resistance: %f Ohms (higher = cleaner air) \n", air_quality_sensor.gasResistance);
+  Serial.printf("Compensated Gas Value: %f Ohms (gas resistance adjusted for temperature and humidity, is only supposed to be used internally by the library) \n", air_quality_sensor.compGasValue);
+  Serial.printf("Compensated Gas Value Accuracy: %hu (0-3, higher = more reliable Compensated Gas Value, may always be reported as 0) \n", air_quality_sensor.compGasAccuracy);
+  Serial.printf("Gas Percentage: %f % (how much the current gas composition deviates from the cleanest air the sensor has ever recorded, alternative to IAQ) \n", air_quality_sensor.gasPercentage);
+  Serial.printf("Gas Percentage Accuracy: %hu (0-3, higher = more reliable Gas Percentage) \n", air_quality_sensor.gasPercentageAccuracy);
+  Serial.printf("IAQ: %f (0-500, lower = cleaner air) \n", air_quality_sensor.iaq);
+  Serial.printf("IAQ Accuracy: %hu (0-3, higher = more reliable IAQ) \n", air_quality_sensor.iaqAccuracy);
+  Serial.printf("Static IAQ: %f (doesn't factor rapid temperature and humidity changes into IAQ calculation, may be more reliable in some cases) \n", air_quality_sensor.staticIaq);
+  Serial.printf("Static IAQ Accuracy: %hu (0-3, higher = more reliable Static IAQ) \n", air_quality_sensor.staticIaqAccuracy);
+  Serial.printf("----------------------------------CO2---------------------------------- \n");
+  Serial.printf("CO2 Equivalent: %f PPM (estimate of how much CO2 is present) \n", air_quality_sensor.co2Equivalent);
+  Serial.printf("CO2 Accuracy: %hu (0-3, higher = more reliable CO2) \n", air_quality_sensor.co2Accuracy);
+  Serial.printf("-------------------------------BREATH VOC------------------------------ \n");
+  Serial.printf("Breath VOC Equivalent: %f PPM (estimate of how many VOCs are present that are typically caused by human presence) \n", air_quality_sensor.breathVocEquivalent);
+  Serial.printf("Breath VOC Accuracy: %hu (0-3, higher = more reliable Breath VOC) \n", air_quality_sensor.breathVocAccuracy);
+  Serial.printf("-------------------------------TEMPERATURE----------------------------- \n");
+  Serial.printf("Raw Temperature: %f C \n", air_quality_sensor.rawTemperature);
+  Serial.printf("Compensated Temperature: %f C (adjusted for the heat from the MOX heater, usually more accurate) \n", air_quality_sensor.temperature);
+  Serial.printf("--------------------------------HUMIDITY------------------------------- \n");
+  Serial.printf("Raw Humidity: %f % \n", air_quality_sensor.rawHumidity);
+  Serial.printf("Compensated Humidity: %f % (adjusted for the heat from the MOX heater, usually more accurate) \n", air_quality_sensor.humidity);
+  Serial.printf("--------------------------------PRESSURE------------------------------- \n");
+  Serial.printf("Pressure: %f PA \n", air_quality_sensor.pressure);
+  Serial.printf("----------------------------------VPD---------------------------------- \n");
+  Serial.printf("VPD (Using Raw Values): %f PA (7000-15000 is a healthy range for crops) \n", calculate_VPD(air_quality_sensor.rawTemperature, air_quality_sensor.rawHumidity));
+  Serial.printf("VPD (Using Compensated Values): %f PA (7000-15000 is a healthy range for crops) \n", calculate_VPD(air_quality_sensor.temperature, air_quality_sensor.humidity));
+  
+  Serial.flush();
+
+  //store the bme state in rtc memory
+  air_quality_sensor.getState(air_quality_state);
+  air_quality_state_available = true;
+
+  //calculate how much time we've wasted since the measurement came in, use it to calculate sleep duration
+  uint64_t time_since_last_measurement = esp_timer_get_time() - measurement_time;
+  uint64_t sleep_duration = measurement_period - time_since_last_measurement - grace_window;
+
+  //update rtc global timer, accounting for the time we're about to spend sleeping and the time we've just spent awake
+  total_time_since_cold_boot += (sleep_duration + esp_timer_get_time());
+
+  //go to sleep
+  esp_sleep_enable_timer_wakeup(sleep_duration);
+  esp_deep_sleep_start();
 }
 
 void loop() {
-  //if a LoRa transmission came in, process it and clear the flag
-  if(pending_lora_packet) {
-    process_lora_packet();
-    pending_lora_packet = false;
-  }
-
-  //do stuff
-
-  //TODO:
-  //1.implement FSM to progress through a wake cycle using the loop
-  //2.figure out how to measure battery life from software
-  //3.figure out air quality sensor 
-  //    -bosch library to get IAQ
-  //    -calibration nightmare
-  //    -look into using VPD instead of IAQ
-  //4.design LoRa packet layout
-  //5.figure out moisture sensor
-  //    -find way make the adafruit STEMMA work for us?
-  //    -buy new sensor?
-  //6.figure out physical aspects of NPK
-  //7.figure out software aspects of NPK
-  //8.smartphone app
-  //9.housing
-  //10.LoRa network stuff (addressing, integrity, collisions, encryption?)
-  //11.LoRa gateway code
+  
 }
 
-uint8_t init_temperature_sensor() {
-  temperature_sensor.begin();
-
-  DeviceAddress device_address;
-
-  if(! temperature_sensor.getAddress(device_address, 0)) {
-    Serial.printf("Temperature sensor failed to initialize!\n");
-
-    return 0;
-  }
-
-  Serial.printf("Temperature sensor online...\n");
-
-  return 1;
-}
-
-float read_temperature_sensor() {
-  temperature_sensor.requestTemperatures();
-  float temp_fahrenheit = temperature_sensor.getTempFByIndex(0);
-
-  Serial.printf("Temperature reading in Fahrenheit: %.3f\n", temp_fahrenheit);
-
-  return temp_fahrenheit;
-}
-
-uint8_t init_moisture_sensor() {
-  if(! moisture_sensor.begin(moisture_sensor_I2C_address)) {
-    Serial.printf("Moisture sensor failed to initialize!\n");
-
-    return 0;
-  }
-
-  Serial.printf("Moisture sensor online...\n");
-
-  return 1;
-}
-
-uint16_t read_moisture_sensor() {
-  uint16_t capacitance = moisture_sensor.touchRead(0);
-
-  Serial.printf("Capacitance reading (higher = more moisture): %hu\n", capacitance);
-
-  return capacitance;
-}
-
-uint8_t init_air_quality_sensor() {
-  air_quality_sensor.begin(air_quality_sensor_I2C_address, Wire);
-  if(! air_quality_sensor.bme68xStatus != BME68X_OK) {
-    Serial.printf("Air quality sensor failed to initialize!\n");
-
-    return 0;
-  }
-
-  bsec_virtual_sensor_t sensor_list[] = {BSEC_OUTPUT_IAQ, BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS};
-  air_quality_sensor.updateSubscription(sensor_list, sizeof(sensor_list) / sizeof(sensor_list[0]), BSEC_SAMPLE_RATE_ULP);
-  //air_quality_sensor.setTemperatureOversampling(BME680_OS_8X);
-  //air_quality_sensor.setHumidityOversampling(BME680_OS_2X);
-  //air_quality_sensor.setPressureOversampling(BME680_OS_4X);
-  //air_quality_sensor.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  //air_quality_sensor.setGasHeater(320, 150);
-
-  Serial.printf("Air quality sensor online...\n");
-
-  return 1;
-}
-
-uint32_t read_air_quality_sensor() {
-  air_quality_sensor.run();
-  uint32_t gas_resistance = (uint32_t)air_quality_sensor.gasResistance;
-
-  Serial.printf("Gas resistance reading (higher = better air quality): %hu \n", gas_resistance);
-
-  return gas_resistance;
-}
-
-uint16_t read_air_quality_index() {
-  air_quality_sensor.run();
-  uint16_t iaq = (uint16_t)air_quality_sensor.iaq;
-
-  Serial.printf("IAQ reading (lower = better air quality): %hu \n", iaq);
-
-  return iaq;
-}
-
-//test
-uint16_t read_vapor_pressure_deficit() {
-  air_quality_sensor.run();
-
-  float temperature = air_quality_sensor.temperature;
-  float humidity = air_quality_sensor.humidity;
-
-  float saturation_vapor_pressure = 0.6108 * exp((17.27 * temperature) / (temperature + 237.3));
-  float actual_vapor_pressure = (humidity / 100.0) * saturation_vapor_pressure;
-  float vapor_pressure_deficit = saturation_vapor_pressure - actual_vapor_pressure;
-
-  uint16_t vpd = (uint16_t)(vapor_pressure_deficit * 100); // Scale up for better resolution
-
-  Serial.printf("VPD Reading: %hu \n", vpd);
-
-  return vpd;
-}
-
-uint8_t init_lora() {
-  uint64_t start_time = esp_timer_get_time();
-
-  LoRa.setPins(CS, RST, G0);
-
-  Serial.printf("Initializing LoRa...");
-
-  while(! LoRa.begin(915E6)) {
-    delay(500);
-    Serial.printf(".");
-
-    if(esp_timer_get_time() - start_time > 10000000) {
-      Serial.printf("\nLoRa failed to initialize!\n\n");
-      
-      return 0;
-    }
-  }
-
-  LoRa.setSyncWord(0xF3);
-
-  LoRa.onReceive(lora_packet_received);
-  LoRa.receive();
-
-  Serial.printf("\nLoRa online!\n\n");
-
-  return 1;
-}
-
-//function is called every time a LoRa packet is received
-//this is called from an ISR and should use ISR best practices
-void lora_packet_received(int packet_size) {
-  pending_lora_packet = true;
-}
-
-void process_lora_packet() {
-
-}
-
-uint8_t send_config_request() {
-
-}
-
-uint8_t send_soil_data(uint8_t* data_buffer, size_t buffer_size) {
-
-}
-
-uint8_t send_acknowledgement() {
-
+float calculate_VPD(float temperature, float humidity) {
+  float SVP = 0.61078 * exp((17.27 * temperature) / (temperature + 237.3)); //Saturation Vapor Pressure  
+  float AVP = SVP * (humidity / 100.0); //Actual Vapor Pressure
+  float VPD = SVP - AVP; //Vapor Pressure Deficit
+    
+  return (VPD * 1000.0); //Convert to Pa
 }
