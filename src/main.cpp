@@ -9,20 +9,79 @@
 #include <Adafruit_seesaw.h>
 
 //libraries for the air quality sensor
-#include <Wire.h> //I2C Bus
-#include <bsec.h> //more complicated bosch library (can do IAQ)
+#include <Wire.h>
+#include <bsec.h>
 
 //libraries for LoRa comms
-#include <LoRa.h>
 #include <SPI.h>
+#include <LoRa.h>
 
 //LoRa transceiver pins
 #define G0 4
 #define CS 17
 #define RST 16
 
+//LoRa defines
+#define FREQUENCY_BAND 915E6
+#define SYNC_WORD 0x12
+#define NETWORK_CODE 0x3D8A
+#define GATEWAY_ID 0x00
+#define SOIL_BUDDY_ID 0x01
+
 //temperature sensor is connected to GPIO 14
 #define temperature_sensor_pin 14
+
+//enum for the different states of the wake cycle
+enum SystemState {
+  UPDATE_CONFIG,
+  WAIT_FOR_BURN_IN,
+  TAKE_MEASUREMENTS,
+  TRANSMIT_DATA,
+  GO_TO_SLEEP
+};
+
+//enum for the different kinds of LoRa packets we'll be sending/receiving
+enum MessageType {
+  CONFIG,
+  DATA,
+  ACK
+};
+
+//defines LoRa packet header
+struct Header {
+  uint16_t network_code;
+  uint8_t recipient_id;
+  uint8_t sender_id;
+  uint8_t message_type;
+  uint8_t payload_length;
+};
+
+//defines what a config packet will contain
+struct ConfigPayload {
+  uint16_t sleep_duration;
+  uint8_t num_of_samples;
+  uint8_t sampling_interval;
+  uint8_t burn_in_time;
+};
+
+//defines what a data packet will contain
+struct DataPayload {
+  float probe_temperature;
+
+  uint16_t stemma_moisture;
+
+  float bme_raw_gas;
+  float bme_iaq;
+  uint8_t bme_iaq_acc;
+  float bme_co2;
+  uint8_t bme_co2_acc;
+  float bme_bvoc;
+  uint8_t bme_bvoc_acc;
+  float bme_comp_temp;
+  float bme_comp_humid;
+  float bme_pressure;
+  float bme_vpd;
+};
 
 //temperature sensor object
 OneWire one_wire(temperature_sensor_pin);
@@ -38,10 +97,22 @@ const uint8_t air_quality_sensor_I2C_address = 0x76;
 
 //volatile flag that gets set every time a new LoRa transmission is received
 volatile bool pending_lora_packet = false;
+//size of the pending packet
+int pending_packet_size = 0;
+
+//time (since boot) in microseconds that we last sent a LoRa transmission
+uint64_t last_transmission_time = 0;
+
+//store config in RTC memory so it survives deep sleep
+//we can just shove the entire packet's payload in when we get it from the gateway
+RTC_DATA_ATTR ConfigPayload config;
+
+//current state of wake cycle
+SystemState system_state;
 
 //temperature sensor functions
 uint8_t init_temperature_sensor(); //sets up temp sensor, returns whether it succeeded
-float read_temperature_sensor(); //returns temp in F
+float read_temperature_sensor(); //returns temp in C
 
 //moisture sensor functions
 uint8_t init_moisture_sensor(); //sets up moisture sensor, returns whether it succeeded
@@ -53,14 +124,13 @@ uint16_t read_air_quality_index(); // returns IAQ (0-500, lower = better air qua
 uint16_t read_vapor_pressure_defecit(); //returns VPD (<0.4: low, 0.4-1.2: sweet spot, 1.2-1.6: high, >1.6: dangerous)
 uint32_t read_air_quality_sensor(); //returns gas resistance (higher = better air quality)
 
-
 //LoRa functions
 uint8_t init_lora(); //sets up LoRa, returns whether it succeeded
 void lora_packet_received(int packet_size); //gets called every time a new LoRa transmission is received
 void process_lora_packet(); //function to process received LoRa packets
-uint8_t send_config_request(); //function to request config from gateway
-uint8_t send_soil_data(uint8_t* data_buffer, size_t buffer_size); //function to send soil data to gateway
-uint8_t send_acknowledgement(); //function to send acknowledgement to gateway
+
+//state functions
+void update_config();
 
 //Setup for RGB LED
 const int redPin = 27;
@@ -91,34 +161,48 @@ void setup() {
 
   //initialize LoRa
   init_lora();
+
+  //initialize state machine
+  system_state = UPDATE_CONFIG;
 }
 
 void loop() {
   //if a LoRa transmission came in, process it and clear the flag
   if(pending_lora_packet) {
     process_lora_packet();
+
+    pending_packet_size = 0;
     pending_lora_packet = false;
   }
 
-  //do stuff
+  //call the corresponding function for whatever state we're in
+  switch(system_state) {
+  case UPDATE_CONFIG:
+    update_config();
+    break;
+  }
+}
 
-  //TODO:
-  //1.implement FSM to progress through a wake cycle using the loop
-  //2.figure out how to measure battery life from software
-  //3.figure out air quality sensor 
-  //    -bosch library to get IAQ
-  //    -calibration nightmare
-  //    -look into using VPD instead of IAQ
-  //4.design LoRa packet layout
-  //5.figure out moisture sensor
-  //    -find way make the adafruit STEMMA work for us?
-  //    -buy new sensor?
-  //6.figure out physical aspects of NPK
-  //7.figure out software aspects of NPK
-  //8.smartphone app
-  //9.housing
-  //10.LoRa network stuff (addressing, integrity, collisions, encryption?)
-  //11.LoRa gateway code
+void update_config() {
+  if(last_transmission_time == 0) {
+    Header header;
+
+    header.network_code = NETWORK_CODE;
+    header.recipient_id = GATEWAY_ID;
+    header.sender_id = SOIL_BUDDY_ID;
+    header.message_type = CONFIG;
+    header.payload_length = 0;
+
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*) &header, sizeof(Header));
+    LoRa.endPacket();
+
+    last_transmission_time = esp_timer_get_time();
+  }
+
+  if((esp_timer_get_time() - last_transmission_time) > 5000000) {
+    last_transmission_time = 0;
+  }
 }
 
 uint8_t init_temperature_sensor() {
@@ -139,11 +223,11 @@ uint8_t init_temperature_sensor() {
 
 float read_temperature_sensor() {
   temperature_sensor.requestTemperatures();
-  float temp_fahrenheit = temperature_sensor.getTempFByIndex(0);
+  float temp_celsius = temperature_sensor.getTempCByIndex(0);
 
-  Serial.printf("Temperature reading in Fahrenheit: %.3f\n", temp_fahrenheit);
+  Serial.printf("Temperature reading in Celsius: %.3f\n", temp_celsius);
 
-  return temp_fahrenheit;
+  return temp_celsius;
 }
 
 uint8_t init_moisture_sensor() {
@@ -176,11 +260,6 @@ uint8_t init_air_quality_sensor() {
 
   bsec_virtual_sensor_t sensor_list[] = {BSEC_OUTPUT_IAQ, BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS};
   air_quality_sensor.updateSubscription(sensor_list, sizeof(sensor_list) / sizeof(sensor_list[0]), BSEC_SAMPLE_RATE_ULP);
-  //air_quality_sensor.setTemperatureOversampling(BME680_OS_8X);
-  //air_quality_sensor.setHumidityOversampling(BME680_OS_2X);
-  //air_quality_sensor.setPressureOversampling(BME680_OS_4X);
-  //air_quality_sensor.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  //air_quality_sensor.setGasHeater(320, 150);
 
   Serial.printf("Air quality sensor online...\n");
 
@@ -205,7 +284,6 @@ uint16_t read_air_quality_index() {
   return iaq;
 }
 
-//test
 uint16_t read_vapor_pressure_deficit() {
   air_quality_sensor.run();
 
@@ -230,7 +308,7 @@ uint8_t init_lora() {
 
   Serial.printf("Initializing LoRa...");
 
-  while(! LoRa.begin(915E6)) {
+  while(! LoRa.begin(FREQUENCY_BAND)) {
     delay(500);
     Serial.printf(".");
 
@@ -241,7 +319,7 @@ uint8_t init_lora() {
     }
   }
 
-  LoRa.setSyncWord(0xF3);
+  LoRa.setSyncWord(SYNC_WORD);
 
   LoRa.onReceive(lora_packet_received);
   LoRa.receive();
@@ -254,21 +332,45 @@ uint8_t init_lora() {
 //function is called every time a LoRa packet is received
 //this is called from an ISR and should use ISR best practices
 void lora_packet_received(int packet_size) {
+  pending_packet_size = packet_size;
   pending_lora_packet = true;
 }
 
 void process_lora_packet() {
+  if(pending_packet_size < sizeof(Header)) {
+    return;
+  }
 
-}
+  Header header;
+  LoRa.readBytes((uint8_t*) &header, sizeof(Header));
 
-uint8_t send_config_request() {
+  if(header.network_code != NETWORK_CODE) {
+    return;
+  }
 
-}
+  if(header.recipient_id != SOIL_BUDDY_ID) {
+    return;
+  }
 
-uint8_t send_soil_data(uint8_t* data_buffer, size_t buffer_size) {
+  if(pending_packet_size < (sizeof(Header) + header.payload_length)) {
+    return;
+  }
 
-}
+  switch(header.message_type) {
+  case CONFIG:
+    ConfigPayload config_payload;
+    LoRa.readBytes((uint8_t*) &config_payload, sizeof(ConfigPayload));
 
-uint8_t send_acknowledgement() {
+    config.sleep_duration = config_payload.sleep_duration;
+    config.num_of_samples = config_payload.num_of_samples;
+    config.sampling_interval = config_payload.sampling_interval;
+    config.burn_in_time = config_payload.burn_in_time;
 
+    system_state = WAIT_FOR_BURN_IN;
+
+    break;
+    
+  case ACK:
+    break;
+  }
 }
