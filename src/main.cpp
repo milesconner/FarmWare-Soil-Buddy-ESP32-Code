@@ -322,7 +322,7 @@ void take_measurements() {
 
       Serial.printf("FINAL TEMPERATURE RESULT: %f C\n", temperature_value);
       Serial.printf("FINAL MOISTURE RESULT: %hu\n", moisture_value);
-      Serial.printf("--------------------------------------------------------------------\n"):
+      Serial.printf("--------------------------------------------------------------------\n");
 
       sensor_data.probe_temp = (int16_t) (temperature_value * 100.0F);
       sensor_data.stemma_moisture = moisture_value;
