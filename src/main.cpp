@@ -171,6 +171,7 @@ float read_temperature_sensor(); //returns temp in C
 //moisture sensor functions
 bool init_moisture_sensor(); //sets up moisture sensor, returns whether it succeeded
 uint16_t read_moisture_sensor(); //returns capacitance (higher = more moisture)
+float read_moisture_content_percent(); //returns moisture content in percent
 
 //LoRa functions
 bool init_lora(); //sets up LoRa, returns whether it succeeded
@@ -525,6 +526,24 @@ uint16_t read_moisture_sensor() {
   Serial.printf("STEMMA Capacitance: %hu\n", capacitance);
 
   return capacitance;
+}
+
+float read_moisture_content_percent() {
+  //calculate moisture content as a percentage
+  //this is a rough estimate based on the capacitance reading
+  //the formula is based on empirical data and may not be accurate for all soil types
+  float moisture_content = (float)(0.02699 * read_moisture_sensor() - 13.36);
+
+  //clamp the value between 0 and 100
+  if(moisture_content < 0) {
+    moisture_content = 0;
+  } else if(moisture_content > 100) {
+    moisture_content = 100;
+  }
+
+  Serial.printf("Moisture Content: %f %%\n", moisture_content);
+
+  return moisture_content;
 }
 
 bool init_lora() {
