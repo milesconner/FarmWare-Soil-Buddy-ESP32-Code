@@ -24,8 +24,8 @@
 
 //LoRa transceiver pins
 #define G0 35
-#define CS 36
-#define RST 39
+#define CS 32
+#define RST 33
 
 //LoRa defines
 #define FREQUENCY_BAND 915E6
