@@ -16,13 +16,16 @@
 #include <SPI.h>
 #include <LoRa.h>
 
+//libraries for Modbus comms
+#include <ModbusMaster.h>
+
 //temperature sensor is connected to GPIO 14
 #define temperature_sensor_pin 14
 
 //LoRa transceiver pins
-#define G0 4
-#define CS 17
-#define RST 16
+#define G0 35
+#define CS 36
+#define RST 39
 
 //LoRa defines
 #define FREQUENCY_BAND 915E6
@@ -37,11 +40,17 @@
 #define TIMEOUT 15000000
 #define MAX_ATTEMPTS 10
 
+//NPK defines
+#define RX_PIN 16
+#define TX_PIN 17
+#define RS485_CONTROL 4
+#define SENSOR_ADDRESS 1
+
 //system configuration defaults
 #define NEXT_BIG_CYCLE_DEFAULT 1
-#define SAMPLING_INTERVAL_DEFAULT 500
-#define NUMBER_OF_STABILIZING_SAMPLES_DEFAULT 5
-#define NUMBER_OF_ACTUAL_SAMPLES_DEFAULT 10
+#define SAMPLING_INTERVAL_DEFAULT 1000
+#define NUMBER_OF_STABILIZING_SAMPLES_DEFAULT 3
+#define NUMBER_OF_ACTUAL_SAMPLES_DEFAULT 12
 
 //enum for the different states of the state machine
 //small cycle: BME_UPKEEP -> GO_TO_SLEEP
@@ -87,6 +96,26 @@ DallasTemperature temperature_sensor(&one_wire);
 Adafruit_seesaw moisture_sensor;
 const uint8_t moisture_sensor_I2C_address = 0x36;
 
+//NPK sensor stuff
+ModbusMaster node;
+
+void preTransmission() {
+    digitalWrite(RS485_CONTROL, HIGH);
+    delay(2);
+}
+
+void postTransmission() {
+    Serial2.flush();
+    digitalWrite(RS485_CONTROL, LOW);
+    delay(2);
+}
+
+struct NPKReading {
+  uint16_t nitrogen;
+  uint16_t phosphorus;
+  uint16_t potassium;
+};
+
 //LoRa packet header struct
 struct __attribute__((packed)) Header {
   uint16_t network_code;
@@ -110,6 +139,10 @@ struct __attribute__((packed)) DataPayload {
   int16_t probe_temp;
 
   uint16_t stemma_moisture;
+
+  uint16_t npk_raw_nit;
+  uint16_t npk_raw_phos;
+  uint16_t npk_raw_pot;
 
   uint8_t bme_acc;
   uint16_t bme_iaq;
@@ -141,6 +174,10 @@ DataPayload sensor_data;
 //basically just used as intermediates, the final average goes in the sensor_data struct
 float temperature_value = 0;
 uint16_t moisture_value = 0;
+uint16_t nitrogen_value = 0;
+uint16_t phosphorus_value = 0;
+uint16_t potassium_value = 0;
+NPKReading npk_value;
 
 //various counters used in take_measurements state
 int64_t measurement_time = 0;
@@ -171,12 +208,15 @@ float read_temperature_sensor(); //returns temp in C
 //moisture sensor functions
 bool init_moisture_sensor(); //sets up moisture sensor, returns whether it succeeded
 uint16_t read_moisture_sensor(); //returns capacitance (higher = more moisture)
-float read_moisture_content_percent(); //returns moisture content in percent
 
 //LoRa functions
 bool init_lora(); //sets up LoRa, returns whether it succeeded
 void lora_packet_received(int packet_size); //gets called every time a new LoRa transmission is received
 void process_lora_packet(); //function to process received LoRa packets
+
+//NPK functions
+void init_npk_sensor(); //sets up the NPK sensor
+void read_npk_sensor(NPKReading &reading); //reads the NPK sensor and stores the result in the reading struct
 
 //utility functions
 int64_t time_alive_milliseconds(); //returns total uptime in milliseconds since first powering on
@@ -286,9 +326,12 @@ void bme_upkeep() {
       //initialize the moisture sensor
       init_moisture_sensor();
 
+      //initialize the NPK sensor
+      init_npk_sensor();
+
       //begin taking other measurements
       measurement_time = esp_timer_get_time();
-      Serial.printf("-------------------- TEMP + MOISTURE READINGS ----------------------\n");
+      Serial.printf("----------------- TEMP + MOISTURE + NPK READINGS -------------------\n");
 
       system_state = TAKE_MEASUREMENTS;
 
@@ -309,6 +352,7 @@ void take_measurements() {
       Serial.printf("Stabilizing... [%u/%u]\n", stabilizing_measurements + 1, config_settings.number_of_stabilizing_samples);
       read_temperature_sensor();
       read_moisture_sensor();
+      read_npk_sensor(npk_value);
       stabilizing_measurements++;
       measurement_time = esp_timer_get_time();
     
@@ -317,6 +361,10 @@ void take_measurements() {
       Serial.printf("Taking samples... [%u/%u]\n", actual_measurements + 1, config_settings.number_of_actual_samples);
       temperature_value += read_temperature_sensor();
       moisture_value += read_moisture_sensor();
+      read_npk_sensor(npk_value);
+      nitrogen_value += npk_value.nitrogen;
+      phosphorus_value += npk_value.phosphorus;
+      potassium_value += npk_value.potassium;
       actual_measurements++;
       measurement_time = esp_timer_get_time();
 
@@ -324,13 +372,22 @@ void take_measurements() {
     } else {
       temperature_value /= actual_measurements;
       moisture_value /= actual_measurements;
+      nitrogen_value /= actual_measurements;
+      phosphorus_value /= actual_measurements;
+      potassium_value /= actual_measurements;
 
       Serial.printf("FINAL TEMPERATURE RESULT: %f C\n", temperature_value);
       Serial.printf("FINAL MOISTURE RESULT: %hu\n", moisture_value);
+      Serial.printf("FINAL RAW NITROGEN RESULT: %hu\n", nitrogen_value);
+      Serial.printf("FINAL RAW PHOSPHORUS RESULT: %hu\n", phosphorus_value);
+      Serial.printf("FINAL RAW POTASSIUM RESULT: %hu\n", potassium_value);
       Serial.printf("--------------------------------------------------------------------\n");
 
       sensor_data.probe_temp = (int16_t) (temperature_value * 100.0F);
       sensor_data.stemma_moisture = moisture_value;
+      sensor_data.npk_raw_nit = nitrogen_value;
+      sensor_data.npk_raw_phos = phosphorus_value;
+      sensor_data.npk_raw_pot = potassium_value;
 
       //initialize LoRa
       init_lora();
@@ -528,24 +585,6 @@ uint16_t read_moisture_sensor() {
   return capacitance;
 }
 
-float read_moisture_content_percent() {
-  //calculate moisture content as a percentage
-  //this is a rough estimate based on the capacitance reading
-  //the formula is based on empirical data and may not be accurate for all soil types
-  float moisture_content = (float)(0.02699 * read_moisture_sensor() - 13.36);
-
-  //clamp the value between 0 and 100
-  if(moisture_content < 0) {
-    moisture_content = 0;
-  } else if(moisture_content > 100) {
-    moisture_content = 100;
-  }
-
-  Serial.printf("Moisture Content: %f %%\n", moisture_content);
-
-  return moisture_content;
-}
-
 bool init_lora() {
   LoRa.setPins(CS, RST, G0);
 
@@ -612,6 +651,43 @@ void process_lora_packet() {
 
   //now that we've received a valid Gateway response, it's time to go to sleep
   system_state = GO_TO_SLEEP;
+}
+
+void init_npk_sensor() {
+  pinMode(RS485_CONTROL, OUTPUT);
+  digitalWrite(RS485_CONTROL, LOW);
+
+  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+
+  node.begin(SENSOR_ADDRESS, Serial2);
+
+  node.preTransmission(preTransmission);
+  node.postTransmission(postTransmission);
+
+  Serial.printf("NPK sensor online...\n");
+}
+
+void read_npk_sensor(NPKReading &reading) {
+  Serial.printf("Reading NPK sensor...\n");
+
+  uint8_t result = node.readHoldingRegisters(0x001E, 3);
+
+  Serial.printf("Modbus result code: %u \n", result);
+
+  if(result == node.ku8MBSuccess) {
+    uint16_t nitrogen = node.getResponseBuffer(0);
+    uint16_t phosphorus = node.getResponseBuffer(1);
+    uint16_t potassium = node.getResponseBuffer(2);
+
+    Serial.printf("Modbus communication successful! Raw Nitrogen: %hu Raw Phosphorus: %hu Raw Potassium: %hu \n", nitrogen, phosphorus, potassium);
+
+    reading.nitrogen = nitrogen;
+    reading.phosphorus = phosphorus;
+    reading.potassium = potassium;
+
+  } else {
+    Serial.printf("Modbus communication failed! Error code: %X \n", result);
+  }
 }
 
 int64_t time_alive_milliseconds() {
