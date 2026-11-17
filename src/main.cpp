@@ -48,7 +48,7 @@
 
 //system configuration defaults
 #define NEXT_BIG_CYCLE_DEFAULT 1
-#define SAMPLING_INTERVAL_DEFAULT 1000
+#define SAMPLING_INTERVAL_DEFAULT 1500
 #define NUMBER_OF_STABILIZING_SAMPLES_DEFAULT 3
 #define NUMBER_OF_ACTUAL_SAMPLES_DEFAULT 12
 
@@ -101,13 +101,13 @@ ModbusMaster node;
 
 void preTransmission() {
     digitalWrite(RS485_CONTROL, HIGH);
-    delay(2);
+    delayMicroseconds(200);
 }
 
 void postTransmission() {
     Serial2.flush();
+    delayMicroseconds(600);
     digitalWrite(RS485_CONTROL, LOW);
-    delay(2);
 }
 
 struct NPKReading {
@@ -668,6 +668,10 @@ void init_npk_sensor() {
 }
 
 void read_npk_sensor(NPKReading &reading) {
+  while (Serial2.available()) {
+    Serial2.read();
+  }
+
   Serial.printf("Reading NPK sensor...\n");
 
   uint8_t result = node.readHoldingRegisters(0x001E, 3);
