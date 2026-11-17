@@ -4,6 +4,7 @@
 //libraries for the air quality sensor
 #include <Wire.h>
 #include <bsec.h>
+#include <Preferences.h>
 
 //libraries for the temperature sensor
 #include <OneWire.h>
@@ -46,6 +47,12 @@
 #define RS485_CONTROL 4
 #define SENSOR_ADDRESS 1
 
+//NVS defines
+#define NVS_NAMESPACE "soil_buddy"
+#define NVS_KEY_TIME "time_alive"
+#define NVS_KEY_STATE "bme_state"
+#define NVS_KEY_STATE_VALID "state_valid"
+
 //system configuration defaults
 #define NEXT_BIG_CYCLE_DEFAULT 1
 #define SAMPLING_INTERVAL_DEFAULT 1500
@@ -87,6 +94,9 @@ bsec_virtual_sensor_t air_quality_sensor_virtual_sensor_list[6] = {
 //air quality sensor object
 Bsec air_quality_sensor;
 const uint8_t air_quality_sensor_I2C_address = 0x76;
+
+//NVS object
+Preferences preferences;
 
 //temperature sensor object
 OneWire one_wire(temperature_sensor_pin);
@@ -200,6 +210,8 @@ void go_to_sleep(); //enter deep sleep
 //air quality sensor functions
 bool init_air_quality_sensor(); //sets up air quality sensor, returns whether it succeeded
 bool air_quality_sensor_status(); //checks for BSEC and BME errors/warnings
+void save_state_to_nvs(); //saves bme state and total uptime to NVS flash
+bool load_state_from_nvs(); //tries to load bme state and total uptime from NVS flash, returns whether it succeeded
 
 //temperature sensor functions
 bool init_temperature_sensor(); //sets up temp sensor, returns whether it succeeded
@@ -230,6 +242,18 @@ void setup() {
   //log a bunch of stuff and check if this is a big cycle
   Serial.printf("\n\nSoil Buddy Prototype is awake...\n");
   print_system_configuration();
+
+  //if RTC memory was wiped by a power loss, try loading from NVS flash
+  if(! air_quality_sensor_state_available) {
+    Serial.printf("RTC state unavailable (cold boot detected). Checking NVS flash...\n");
+
+    if(load_state_from_nvs()) {
+      Serial.printf("Successfully restored BME680 state and uptime from NVS flash!\n");
+
+    } else {
+      Serial.printf("No valid state found in NVS flash. Starting fresh (this is the first EVER cycle).\n");
+    }
+  }
 
   wake_up_counter++;
   Serial.printf("Beginning wake cycle [%hu/%hu]...\n", wake_up_counter, config_settings.next_big_cycle);
@@ -470,6 +494,11 @@ void go_to_sleep() {
   int64_t sleep_duration = air_quality_sensor.nextCall - time_alive_milliseconds();
   time_alive_microseconds += (esp_timer_get_time() + (sleep_duration * 1000));
 
+  //save BME state and uptime to NVS flash on big cycles
+  if(big_cycle) {
+    save_state_to_nvs();
+  }
+
   //go to sleep
   esp_sleep_enable_timer_wakeup(sleep_duration * 1000);
   esp_deep_sleep_start();
@@ -503,7 +532,7 @@ bool init_air_quality_sensor() {
     }
 
   } else {
-    Serial.printf("Warning: No BSEC state found! Is this the first cycle?\n");
+    Serial.printf("Warning: No BSEC state found! Is this the first EVER cycle?\n");
   }
 
   //set virtual sensor list and ULP sample rate
@@ -538,6 +567,32 @@ bool air_quality_sensor_status() {
   }
 
   return status;
+}
+
+void save_state_to_nvs() {
+  preferences.begin(NVS_NAMESPACE, false);
+  
+  preferences.putLong64(NVS_KEY_TIME, time_alive_microseconds);
+  preferences.putBytes(NVS_KEY_STATE, air_quality_sensor_state, BSEC_MAX_STATE_BLOB_SIZE);
+  preferences.putBool(NVS_KEY_STATE_VALID, air_quality_sensor_state_available);
+  
+  preferences.end();
+}
+
+bool load_state_from_nvs() {
+  preferences.begin(NVS_NAMESPACE, true);
+  
+  bool valid = preferences.getBool(NVS_KEY_STATE_VALID, false);
+
+  if(valid) {
+    time_alive_microseconds = preferences.getLong64(NVS_KEY_TIME, 0);
+    size_t length = preferences.getBytes(NVS_KEY_STATE, air_quality_sensor_state, BSEC_MAX_STATE_BLOB_SIZE);
+    air_quality_sensor_state_available = (length == BSEC_MAX_STATE_BLOB_SIZE);
+  }
+  
+  preferences.end();
+
+  return air_quality_sensor_state_available;
 }
 
 bool init_temperature_sensor() {
